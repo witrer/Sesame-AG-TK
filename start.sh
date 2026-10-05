@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SSH_USER="${SSH_USER:-remoteai}"
+SSH_USER="root"
 SSH_PORT="${SSH_PORT:-22222}"
 BORE_SERVER="${BORE_SERVER:-bore.pub}"
 BORE_VERSION="${BORE_VERSION:-0.6.0}"
@@ -107,10 +107,6 @@ fi
 
 echo "[1/5] 配置 SSH: 127.0.0.1:$SSH_PORT"
 
-if ! id "$SSH_USER" >/dev/null 2>&1; then
-  useradd -m -s /bin/bash "$SSH_USER"
-fi
-
 if [ ! -s "$PASS_FILE" ]; then
   openssl rand -base64 30 | tr -d '/+=' | cut -c1-24 > "$PASS_FILE"
   chmod 600 "$PASS_FILE"
@@ -129,7 +125,7 @@ HostKey $APP_DIR/keys/ssh_host_ed25519_key
 HostKey $APP_DIR/keys/ssh_host_rsa_key
 PasswordAuthentication yes
 PermitEmptyPasswords no
-PermitRootLogin no
+PermitRootLogin yes
 PubkeyAuthentication yes
 KbdInteractiveAuthentication no
 UsePAM yes
