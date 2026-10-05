@@ -212,7 +212,17 @@ echo "[remote-ssh] 本机 SSH 握手正常"
 
 nohup bash -c '
 while true; do
-  yes "" | ssh -tt -p 443     -i "'"$PINGGY_KEY"'"     -o IdentitiesOnly=yes     -o StrictHostKeyChecking=no     -o UserKnownHostsFile=/dev/null     -o PreferredAuthentications=publickey,password,keyboard-interactive     -o ServerAliveInterval=30     -o ServerAliveCountMax=3     -o ConnectTimeout=15     -R "0:127.0.0.1:'"$SSH_PORT"'"     tcp@free.pinggy.io >> "'"$TUNNEL_LOG"'" 2>&1 || true
+  ssh -T -p 443 \
+    -i "'"$PINGGY_KEY"'" \
+    -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ConnectTimeout=15 \
+    -o ExitOnForwardFailure=yes \
+    -R "0:localhost:'"$SSH_PORT"'" \
+    tcp@free.pinggy.io </dev/null >> "'"$TUNNEL_LOG"'" 2>&1 || true
   sleep 5
 done
 ' >/dev/null 2>&1 &
@@ -227,18 +237,44 @@ for _ in $(seq 1 45); do
   sleep 1
 done
 
-echo
-echo "========================================"
-echo "            REMOTE SSH READY"
-echo "========================================"
-echo "WorkDir  : $APP_DIR"
-echo "User     : $SSH_USER"
-echo "Password : $PASS"
-
 if [ -n "$ENDPOINT" ]; then
   HOSTPORT="${ENDPOINT#tcp://}"
   HOST="${HOSTPORT%:*}"
   PORT="${HOSTPORT##*:}"
+
+  echo "[remote-ssh] 公网端到端 SSH Banner 自检..."
+  PUBLIC_BANNER="$(python3 - "$HOST" "$PORT" <<'PY' 2>/dev/null || true
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+try:
+    with socket.create_connection((host, port), timeout=8) as s:
+        s.settimeout(8)
+        data = s.recv(256)
+        print(data.decode("ascii", "replace").strip())
+except Exception:
+    pass
+PY
+)"
+
+  if [[ "$PUBLIC_BANNER" != SSH-2.0-* ]]; then
+    echo "ERROR: 公网 TCP 已分配，但没有收到 SSH Banner"
+    echo "Endpoint : $ENDPOINT"
+    echo "Public   : ${PUBLIC_BANNER:-<empty>}"
+    echo "--- Pinggy log ---"
+    tail -n 80 "$TUNNEL_LOG" 2>/dev/null || true
+    echo "--- sshd log ---"
+    tail -n 80 "$SSHD_LOG" 2>/dev/null || true
+    exit 3
+  fi
+
+  echo "[remote-ssh] 公网 SSH Banner 正常: $PUBLIC_BANNER"
+  echo
+  echo "========================================"
+  echo "            REMOTE SSH READY"
+  echo "========================================"
+  echo "WorkDir  : $APP_DIR"
+  echo "User     : $SSH_USER"
+  echo "Password : $PASS"
   echo "Endpoint : $ENDPOINT"
   echo "Host     : $HOST"
   echo "Port     : $PORT"
