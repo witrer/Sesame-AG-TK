@@ -60,8 +60,10 @@ SSHD_CONFIG="${APP_DIR}/sshd_config"
 SSHD_LOG="${APP_DIR}/sshd.log"
 TUNNEL_LOG="${APP_DIR}/tunnel.log"
 TUNNEL_PID="${APP_DIR}/tunnel.pid"
+WATCHER_PID="${APP_DIR}/watcher.pid"
 SSHD_PID="${APP_DIR}/sshd.pid"
 PINGGY_KEY="${APP_DIR}/pinggy_ed25519"
+STATUS_FILE="${APP_DIR}/current.txt"
 LOCK_DIR="${APP_DIR}/instance.lock"
 
 # Ensure only one launcher instance can manage the service at a time.
@@ -80,6 +82,11 @@ echo $ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
 # Kill only prior services created by this launcher.
+if [ -s "$WATCHER_PID" ]; then
+  OLD_WATCHER_PID="$(cat "$WATCHER_PID" 2>/dev/null || true)"
+  [ -n "$OLD_WATCHER_PID" ] && kill "$OLD_WATCHER_PID" 2>/dev/null || true
+  rm -f "$WATCHER_PID"
+fi
 if [ -s "$TUNNEL_PID" ]; then
   OLD_TUNNEL_PID="$(cat "$TUNNEL_PID" 2>/dev/null || true)"
   [ -n "$OLD_TUNNEL_PID" ] && kill "$OLD_TUNNEL_PID" 2>/dev/null || true
@@ -212,6 +219,7 @@ echo "[remote-ssh] 本机 SSH 握手正常"
 
 nohup bash -c '
 while true; do
+  echo "===== NEW TUNNEL $(date -Is) =====" >> "'"$TUNNEL_LOG"'"
   ssh -T -p 443 \
     -i "'"$PINGGY_KEY"'" \
     -o IdentitiesOnly=yes \
@@ -223,10 +231,37 @@ while true; do
     -o ExitOnForwardFailure=yes \
     -R "0:localhost:'"$SSH_PORT"'" \
     tcp@free.pinggy.io </dev/null >> "'"$TUNNEL_LOG"'" 2>&1 || true
+  echo "===== TUNNEL ENDED $(date -Is), renewing in 5s =====" >> "'"$TUNNEL_LOG"'"
   sleep 5
 done
 ' >/dev/null 2>&1 &
 echo $! > "$TUNNEL_PID"
+
+# Continuously track renewed Pinggy endpoints. Free tunnels expire after ~60 min;
+# the tunnel supervisor reconnects automatically and this watcher updates current.txt.
+nohup bash -c '
+last=""
+while true; do
+  ep="$(grep -Eo "tcp://[^[:space:]]+:[0-9]+" "'"$TUNNEL_LOG"'" 2>/dev/null | tail -n1 | tr -d "\r" || true)"
+  if [ -n "$ep" ] && [ "$ep" != "$last" ]; then
+    hp="${ep#tcp://}"
+    h="${hp%:*}"
+    p="${hp##*:}"
+    {
+      echo "Updated  : $(date -Is)"
+      echo "Endpoint : $ep"
+      echo "Host     : $h"
+      echo "Port     : $p"
+      echo "User     : '"$SSH_USER"'"
+      echo "Password : '"$PASS"'"
+      echo "Connect  : ssh -p $p '"$SSH_USER"'@$h"
+    } > "'"$STATUS_FILE"'"
+    last="$ep"
+  fi
+  sleep 2
+done
+' >/dev/null 2>&1 &
+echo $! > "$WATCHER_PID"
 
 ENDPOINT=""
 for _ in $(seq 1 45); do
@@ -280,6 +315,8 @@ PY
   echo "Port     : $PORT"
   echo "Address  : $HOST:$PORT"
   echo "Connect  : ssh -p $PORT $SSH_USER@$HOST"
+  echo "Status   : $STATUS_FILE"
+  echo "Renewal  : automatic after free-tunnel expiry"
   echo "========================================"
 else
   echo "Tunnel   : FAILED"
