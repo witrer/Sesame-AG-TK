@@ -62,9 +62,33 @@ TUNNEL_LOG="${APP_DIR}/tunnel.log"
 TUNNEL_PID="${APP_DIR}/tunnel.pid"
 SSHD_PID="${APP_DIR}/sshd.pid"
 PINGGY_KEY="${APP_DIR}/pinggy_ed25519"
+LOCK_DIR="${APP_DIR}/instance.lock"
 
-# Clean up only sshd instances started with this script's config.
+# Ensure only one launcher instance can manage the service at a time.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "[remote-ssh] 检测到已有启动流程，清理旧锁并重试..."
+  OLD_PID=""
+  [ -f "$LOCK_DIR/pid" ] && OLD_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR"
+fi
+echo $ > "$LOCK_DIR/pid"
+trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+
+# Kill only prior services created by this launcher.
+if [ -s "$TUNNEL_PID" ]; then
+  OLD_TUNNEL_PID="$(cat "$TUNNEL_PID" 2>/dev/null || true)"
+  [ -n "$OLD_TUNNEL_PID" ] && kill "$OLD_TUNNEL_PID" 2>/dev/null || true
+  rm -f "$TUNNEL_PID"
+fi
+pkill -f "[t]cp@free\.pinggy\.io" >/dev/null 2>&1 || true
 pkill -f "[s]shd -f $SSHD_CONFIG" >/dev/null 2>&1 || true
+[ -s "$SSHD_PID" ] && kill "$(cat "$SSHD_PID" 2>/dev/null || true)" 2>/dev/null || true
+rm -f "$SSHD_PID"
 sleep 1
 
 SSH_PORT="$(pick_ssh_port)" || exit 1
@@ -72,6 +96,7 @@ SSH_PORT="$(pick_ssh_port)" || exit 1
 mkdir -p "$APP_DIR"
 chmod 700 "$APP_DIR"
 echo "[remote-ssh] 工作目录: $APP_DIR"
+echo "[remote-ssh] 单实例模式: enabled"
 echo "[remote-ssh] SSH端口: $SSH_PORT"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -183,12 +208,6 @@ if ! timeout 8 ssh-keyscan -T 5 -p "$SSH_PORT" 127.0.0.1 >/dev/null 2>>"$SSHD_LO
 fi
 echo "[remote-ssh] 本机 SSH 握手正常"
 
-if [ -s "$TUNNEL_PID" ] && kill -0 "$(cat "$TUNNEL_PID")" 2>/dev/null; then
-  kill "$(cat "$TUNNEL_PID")" 2>/dev/null || true
-  sleep 1
-fi
-
-pkill -f 'tcp@free\.pinggy\.io' >/dev/null 2>&1 || true
 : > "$TUNNEL_LOG"
 
 nohup bash -c '
