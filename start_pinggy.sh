@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SSH_PORT="${SSH_PORT:-22222}"
-SSH_USER="${SSH_USER:-remoteai}"
+SSH_USER="root"
 
 port_is_free() {
   local p="$1"
@@ -54,7 +54,7 @@ APP_DIR="$(pick_app_dir)" || {
   exit 1
 }
 
-SSH_USER="${SSH_USER:-remoteai}"
+SSH_USER="root"
 PASS_FILE="${APP_DIR}/password"
 SSHD_CONFIG="${APP_DIR}/sshd_config"
 SSHD_LOG="${APP_DIR}/sshd.log"
@@ -129,17 +129,6 @@ if ! command -v sshd >/dev/null 2>&1 || ! command -v ssh >/dev/null 2>&1; then
   install_pkg
 fi
 
-if ! id "$SSH_USER" >/dev/null 2>&1; then
-  if [ -d /home ] && [ -w /home ]; then
-    useradd -m -s /bin/bash "$SSH_USER"
-  else
-    USER_HOME="$APP_DIR/home-$SSH_USER"
-    mkdir -p "$USER_HOME"
-    useradd -M -d "$USER_HOME" -s /bin/bash "$SSH_USER"
-    chown -R "$SSH_USER:$SSH_USER" "$USER_HOME"
-  fi
-fi
-
 if [ ! -s "$PASS_FILE" ]; then
   PASS="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)"
   printf '%s' "$PASS" > "$PASS_FILE"
@@ -169,7 +158,7 @@ HostKey $APP_DIR/keys/ssh_host_ed25519_key
 HostKey $APP_DIR/keys/ssh_host_rsa_key
 PasswordAuthentication yes
 PermitEmptyPasswords no
-PermitRootLogin no
+PermitRootLogin yes
 PubkeyAuthentication yes
 ChallengeResponseAuthentication no
 UsePAM yes
