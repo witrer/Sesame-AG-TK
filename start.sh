@@ -4,23 +4,30 @@ set -Eeuo pipefail
 SSH_PORT="${SSH_PORT:-22222}"
 SSH_USER="${SSH_USER:-remoteai}"
 
-port_in_use() {
-  ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${1}$"
+port_is_free() {
+  local p="$1"
+  python3 - "$p" <<'PY' >/dev/null 2>&1
+import socket, sys
+p = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(("127.0.0.1", p))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
 }
 
 pick_ssh_port() {
   local p
-  if ! port_in_use "$SSH_PORT"; then
-    printf '%s' "$SSH_PORT"
-    return
-  fi
-  for p in $(seq 22223 22350); do
-    if ! port_in_use "$p"; then
+  for p in "$SSH_PORT" $(seq 22223 22399); do
+    if port_is_free "$p"; then
       printf '%s' "$p"
       return
     fi
   done
-  echo "ERROR: 22222-22350 没有可用端口" >&2
+  echo "ERROR: 22222-22399 没有可用端口" >&2
   return 1
 }
 
@@ -47,7 +54,6 @@ APP_DIR="$(pick_app_dir)" || {
   exit 1
 }
 
-SSH_PORT="$(pick_ssh_port)" || exit 1
 SSH_USER="${SSH_USER:-remoteai}"
 PASS_FILE="${APP_DIR}/password"
 SSHD_CONFIG="${APP_DIR}/sshd_config"
@@ -56,6 +62,12 @@ TUNNEL_LOG="${APP_DIR}/tunnel.log"
 TUNNEL_PID="${APP_DIR}/tunnel.pid"
 SSHD_PID="${APP_DIR}/sshd.pid"
 PINGGY_KEY="${APP_DIR}/pinggy_ed25519"
+
+# Clean up only sshd instances started with this script's config.
+pkill -f "[s]shd -f $SSHD_CONFIG" >/dev/null 2>&1 || true
+sleep 1
+
+SSH_PORT="$(pick_ssh_port)" || exit 1
 
 mkdir -p "$APP_DIR"
 chmod 700 "$APP_DIR"
@@ -139,14 +151,22 @@ AllowUsers $SSH_USER
 Subsystem sftp internal-sftp
 EOF
 
-if [ -s "$SSHD_PID" ] && kill -0 "$(cat "$SSHD_PID")" 2>/dev/null; then
-  kill "$(cat "$SSHD_PID")" 2>/dev/null || true
-  sleep 1
-fi
-
+rm -f "$SSHD_PID"
+: > "$SSHD_LOG"
 /usr/sbin/sshd -f "$SSHD_CONFIG" -E "$SSHD_LOG"
 
-if ! ss -ltn 2>/dev/null | grep -q "127.0.0.1:$SSH_PORT"; then
+if ! python3 - "$SSH_PORT" <<'PY' >/dev/null 2>&1
+import socket, sys
+s = socket.socket()
+s.settimeout(2)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+then
   echo "ERROR: sshd 未能监听 127.0.0.1:$SSH_PORT"
   tail -n 50 "$SSHD_LOG" 2>/dev/null || true
   exit 1
