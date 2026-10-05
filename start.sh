@@ -1,7 +1,32 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_DIR="${HOME}/.remote-ssh"
+SSH_PORT="${SSH_PORT:-22222}"
+SSH_USER="${SSH_USER:-remoteai}"
+
+pick_app_dir() {
+  local c
+  if [ -n "${REMOTE_SSH_DIR:-}" ]; then
+    c="$REMOTE_SSH_DIR"
+    mkdir -p "$c" 2>/dev/null && touch "$c/.write-test" 2>/dev/null && rm -f "$c/.write-test" && { printf '%s' "$c"; return; }
+  fi
+  for c in "/mnt/workspace/.remote-ssh" "${PWD}/.remote-ssh" "${HOME:-}/.remote-ssh" "/tmp/remote-ssh-$(id -u)"; do
+    [ -n "$c" ] || continue
+    mkdir -p "$c" 2>/dev/null || continue
+    if touch "$c/.write-test" 2>/dev/null; then
+      rm -f "$c/.write-test"
+      printf '%s' "$c"
+      return
+    fi
+  done
+  return 1
+}
+
+APP_DIR="$(pick_app_dir)" || {
+  echo "ERROR: 找不到可写工作目录"
+  exit 1
+}
+
 SSH_PORT="${SSH_PORT:-22222}"
 SSH_USER="${SSH_USER:-remoteai}"
 PASS_FILE="${APP_DIR}/password"
@@ -14,6 +39,7 @@ PINGGY_KEY="${APP_DIR}/pinggy_ed25519"
 
 mkdir -p "$APP_DIR"
 chmod 700 "$APP_DIR"
+echo "[remote-ssh] 工作目录: $APP_DIR"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERROR: 请用 root 运行：sudo bash"
@@ -39,7 +65,14 @@ if ! command -v sshd >/dev/null 2>&1 || ! command -v ssh >/dev/null 2>&1; then
 fi
 
 if ! id "$SSH_USER" >/dev/null 2>&1; then
-  useradd -m -s /bin/bash "$SSH_USER"
+  if [ -d /home ] && [ -w /home ]; then
+    useradd -m -s /bin/bash "$SSH_USER"
+  else
+    USER_HOME="$APP_DIR/home-$SSH_USER"
+    mkdir -p "$USER_HOME"
+    useradd -M -d "$USER_HOME" -s /bin/bash "$SSH_USER"
+    chown -R "$SSH_USER:$SSH_USER" "$USER_HOME"
+  fi
 fi
 
 if [ ! -s "$PASS_FILE" ]; then
@@ -127,6 +160,7 @@ echo
 echo "========================================"
 echo "            REMOTE SSH READY"
 echo "========================================"
+echo "WorkDir  : $APP_DIR"
 echo "User     : $SSH_USER"
 echo "Password : $PASS"
 
