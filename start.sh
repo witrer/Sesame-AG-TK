@@ -1,17 +1,82 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SSH_PORT="${SSH_PORT:-22222}"
 SSH_USER="${SSH_USER:-remoteai}"
+SSH_PORT="${SSH_PORT:-22222}"
+BORE_SERVER="${BORE_SERVER:-bore.pub}"
+BORE_VERSION="${BORE_VERSION:-0.6.0}"
 
-port_is_free() {
-  local p="$1"
-  python3 - "$p" <<'PY' >/dev/null 2>&1
+pick_app_dir() {
+  local d
+  for d in "${REMOTE_SSH_DIR:-}" "/mnt/workspace/.remote-ssh" "${PWD}/.remote-ssh" "${HOME:-}/.remote-ssh" "/tmp/remote-ssh-$(id -u)"; do
+    [ -n "$d" ] || continue
+    mkdir -p "$d" 2>/dev/null || continue
+    if touch "$d/.write-test" 2>/dev/null; then
+      rm -f "$d/.write-test"
+      printf '%s' "$d"
+      return
+    fi
+  done
+  return 1
+}
+
+APP_DIR="$(pick_app_dir)" || { echo "ERROR: 找不到可写目录"; exit 1; }
+PASS_FILE="$APP_DIR/password"
+SSHD_CONFIG="$APP_DIR/sshd_config"
+SSHD_LOG="$APP_DIR/sshd.log"
+SSHD_PID="$APP_DIR/sshd.pid"
+TUNNEL_LOG="$APP_DIR/bore.log"
+TUNNEL_PID="$APP_DIR/bore.pid"
+SUPERVISOR_PID="$APP_DIR/supervisor.pid"
+STATUS_FILE="$APP_DIR/current.txt"
+BORE_BIN="$APP_DIR/bore"
+BORE_PORT_FILE="$APP_DIR/bore_remote_port"
+LOCK_DIR="$APP_DIR/instance.lock"
+
+[ "$(id -u)" -eq 0 ] || { echo "ERROR: 当前版本需要 root"; exit 1; }
+
+mkdir -p "$APP_DIR"
+chmod 700 "$APP_DIR"
+
+# Stop previous launcher-managed processes only.
+for pf in "$SUPERVISOR_PID" "$TUNNEL_PID" "$SSHD_PID"; do
+  if [ -s "$pf" ]; then
+    p="$(cat "$pf" 2>/dev/null || true)"
+    [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    rm -f "$pf"
+  fi
+done
+pkill -f "[s]shd -f $SSHD_CONFIG" >/dev/null 2>&1 || true
+sleep 1
+
+rm -rf "$LOCK_DIR"
+mkdir "$LOCK_DIR"
+echo $$ > "$LOCK_DIR/pid"
+trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+
+install_base() {
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server openssh-client curl ca-certificates python3 openssl tar >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y openssh-server openssh-clients curl ca-certificates python3 openssl tar >/dev/null 2>&1
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y openssh-server openssh-clients curl ca-certificates python3 openssl tar >/dev/null 2>&1
+  else
+    echo "ERROR: 不支持当前包管理器"
+    exit 1
+  fi
+}
+
+command -v sshd >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || install_base
+
+port_free() {
+  python3 - "$1" <<'PY' >/dev/null 2>&1
 import socket, sys
-p = int(sys.argv[1])
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+p=int(sys.argv[1])
+s=socket.socket()
 try:
-    s.bind(("127.0.0.1", p))
+    s.bind(("127.0.0.1",p))
 except OSError:
     sys.exit(1)
 finally:
@@ -19,314 +84,231 @@ finally:
 PY
 }
 
-pick_ssh_port() {
-  local p
-  for p in "$SSH_PORT" $(seq 22223 22399); do
-    if port_is_free "$p"; then
-      printf '%s' "$p"
-      return
-    fi
+if ! port_free "$SSH_PORT"; then
+  for p in $(seq 22223 22399); do
+    if port_free "$p"; then SSH_PORT="$p"; break; fi
   done
-  echo "ERROR: 22222-22399 没有可用端口" >&2
-  return 1
-}
-
-pick_app_dir() {
-  local c
-  if [ -n "${REMOTE_SSH_DIR:-}" ]; then
-    c="$REMOTE_SSH_DIR"
-    mkdir -p "$c" 2>/dev/null && touch "$c/.write-test" 2>/dev/null && rm -f "$c/.write-test" && { printf '%s' "$c"; return; }
-  fi
-  for c in "/mnt/workspace/.remote-ssh" "${PWD}/.remote-ssh" "${HOME:-}/.remote-ssh" "/tmp/remote-ssh-$(id -u)"; do
-    [ -n "$c" ] || continue
-    mkdir -p "$c" 2>/dev/null || continue
-    if touch "$c/.write-test" 2>/dev/null; then
-      rm -f "$c/.write-test"
-      printf '%s' "$c"
-      return
-    fi
-  done
-  return 1
-}
-
-APP_DIR="$(pick_app_dir)" || {
-  echo "ERROR: 找不到可写工作目录"
-  exit 1
-}
-
-SSH_USER="${SSH_USER:-remoteai}"
-PASS_FILE="${APP_DIR}/password"
-SSHD_CONFIG="${APP_DIR}/sshd_config"
-SSHD_LOG="${APP_DIR}/sshd.log"
-TUNNEL_LOG="${APP_DIR}/tunnel.log"
-TUNNEL_PID="${APP_DIR}/tunnel.pid"
-WATCHER_PID="${APP_DIR}/watcher.pid"
-SSHD_PID="${APP_DIR}/sshd.pid"
-PINGGY_KEY="${APP_DIR}/pinggy_ed25519"
-STATUS_FILE="${APP_DIR}/current.txt"
-LOCK_DIR="${APP_DIR}/instance.lock"
-
-# Ensure only one launcher instance can manage the service at a time.
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "[remote-ssh] 检测到已有启动流程，清理旧锁并重试..."
-  OLD_PID=""
-  [ -f "$LOCK_DIR/pid" ] && OLD_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-    kill "$OLD_PID" 2>/dev/null || true
-    sleep 1
-  fi
-  rm -rf "$LOCK_DIR"
-  mkdir "$LOCK_DIR"
-fi
-echo $ > "$LOCK_DIR/pid"
-trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
-
-# Kill only prior services created by this launcher.
-if [ -s "$WATCHER_PID" ]; then
-  OLD_WATCHER_PID="$(cat "$WATCHER_PID" 2>/dev/null || true)"
-  [ -n "$OLD_WATCHER_PID" ] && kill "$OLD_WATCHER_PID" 2>/dev/null || true
-  rm -f "$WATCHER_PID"
-fi
-if [ -s "$TUNNEL_PID" ]; then
-  OLD_TUNNEL_PID="$(cat "$TUNNEL_PID" 2>/dev/null || true)"
-  [ -n "$OLD_TUNNEL_PID" ] && kill "$OLD_TUNNEL_PID" 2>/dev/null || true
-  rm -f "$TUNNEL_PID"
-fi
-pkill -f "[t]cp@free\.pinggy\.io" >/dev/null 2>&1 || true
-pkill -f "[s]shd -f $SSHD_CONFIG" >/dev/null 2>&1 || true
-[ -s "$SSHD_PID" ] && kill "$(cat "$SSHD_PID" 2>/dev/null || true)" 2>/dev/null || true
-rm -f "$SSHD_PID"
-sleep 1
-
-SSH_PORT="$(pick_ssh_port)" || exit 1
-
-mkdir -p "$APP_DIR"
-chmod 700 "$APP_DIR"
-echo "[remote-ssh] 工作目录: $APP_DIR"
-echo "[remote-ssh] 单实例模式: enabled"
-echo "[remote-ssh] SSH端口: $SSH_PORT"
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "ERROR: 请用 root 运行：sudo bash"
-  exit 1
 fi
 
-install_pkg() {
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server openssh-client openssl >/dev/null 2>&1
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y openssh-server openssh-clients openssl >/dev/null 2>&1
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y openssh-server openssh-clients openssl >/dev/null 2>&1
-  else
-    echo "ERROR: 当前系统缺少受支持的包管理器"
-    exit 1
-  fi
-}
-
-if ! command -v sshd >/dev/null 2>&1 || ! command -v ssh >/dev/null 2>&1; then
-  install_pkg
-fi
+echo "[1/5] 配置 SSH: 127.0.0.1:$SSH_PORT"
 
 if ! id "$SSH_USER" >/dev/null 2>&1; then
-  if [ -d /home ] && [ -w /home ]; then
-    useradd -m -s /bin/bash "$SSH_USER"
-  else
-    USER_HOME="$APP_DIR/home-$SSH_USER"
-    mkdir -p "$USER_HOME"
-    useradd -M -d "$USER_HOME" -s /bin/bash "$SSH_USER"
-    chown -R "$SSH_USER:$SSH_USER" "$USER_HOME"
-  fi
+  useradd -m -s /bin/bash "$SSH_USER"
 fi
 
 if [ ! -s "$PASS_FILE" ]; then
-  PASS="$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)"
-  printf '%s' "$PASS" > "$PASS_FILE"
+  openssl rand -base64 30 | tr -d '/+=' | cut -c1-24 > "$PASS_FILE"
   chmod 600 "$PASS_FILE"
-else
-  PASS="$(cat "$PASS_FILE")"
 fi
-echo "${SSH_USER}:${PASS}" | chpasswd
+PASS="$(cat "$PASS_FILE")"
+echo "$SSH_USER:$PASS" | chpasswd
 
 mkdir -p "$APP_DIR/keys" /run/sshd
-
-if [ ! -f "$APP_DIR/keys/ssh_host_ed25519_key" ]; then
-  ssh-keygen -q -t ed25519 -N "" -f "$APP_DIR/keys/ssh_host_ed25519_key"
-fi
-if [ ! -f "$APP_DIR/keys/ssh_host_rsa_key" ]; then
-  ssh-keygen -q -t rsa -b 3072 -N "" -f "$APP_DIR/keys/ssh_host_rsa_key"
-fi
-if [ ! -f "$PINGGY_KEY" ]; then
-  ssh-keygen -q -t ed25519 -N "" -f "$PINGGY_KEY"
-fi
+[ -f "$APP_DIR/keys/ssh_host_ed25519_key" ] || ssh-keygen -q -t ed25519 -N "" -f "$APP_DIR/keys/ssh_host_ed25519_key"
+[ -f "$APP_DIR/keys/ssh_host_rsa_key" ] || ssh-keygen -q -t rsa -b 3072 -N "" -f "$APP_DIR/keys/ssh_host_rsa_key"
 
 cat > "$SSHD_CONFIG" <<EOF
 Port $SSH_PORT
 ListenAddress 127.0.0.1
-Protocol 2
 HostKey $APP_DIR/keys/ssh_host_ed25519_key
 HostKey $APP_DIR/keys/ssh_host_rsa_key
 PasswordAuthentication yes
 PermitEmptyPasswords no
 PermitRootLogin no
 PubkeyAuthentication yes
-ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 UsePAM yes
 PrintMotd no
 PrintLastLog no
 X11Forwarding no
 AllowTcpForwarding yes
-GatewayPorts no
 ClientAliveInterval 60
 ClientAliveCountMax 3
+MaxAuthTries 3
 PidFile $SSHD_PID
 AllowUsers $SSH_USER
 Subsystem sftp internal-sftp
 EOF
 
-rm -f "$SSHD_PID"
 : > "$SSHD_LOG"
 /usr/sbin/sshd -f "$SSHD_CONFIG" -E "$SSHD_LOG"
 
-if ! python3 - "$SSH_PORT" <<'PY' >/dev/null 2>&1
-import socket, sys
-s = socket.socket()
-s.settimeout(2)
+if ! timeout 8 ssh-keyscan -T 5 -p "$SSH_PORT" 127.0.0.1 >/dev/null 2>>"$SSHD_LOG"; then
+  echo "ERROR: 本机 SSH 握手失败"
+  tail -n 80 "$SSHD_LOG" || true
+  exit 1
+fi
+echo "[2/5] 本机 SSH 握手正常"
+
+install_bore() {
+  if command -v bore >/dev/null 2>&1; then
+    BORE_BIN="$(command -v bore)"
+    return 0
+  fi
+  if [ -x "$BORE_BIN" ]; then return 0; fi
+
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) target="x86_64-unknown-linux-musl" ;;
+    aarch64|arm64) target="aarch64-unknown-linux-musl" ;;
+    *) echo "ERROR: Bore 暂不支持此架构: $arch"; return 1 ;;
+  esac
+
+  url="https://github.com/ekzhang/bore/releases/download/v$BORE_VERSION/bore-v$BORE_VERSION-$target.tar.gz"
+  tmp="$APP_DIR/bore.tar.gz"
+  echo "[3/5] 下载 Bore v$BORE_VERSION ($target)..."
+  if curl -fL --connect-timeout 12 --retry 2 "$url" -o "$tmp"; then
+    tar -xzf "$tmp" -C "$APP_DIR"
+    rm -f "$tmp"
+    chmod +x "$BORE_BIN"
+    return 0
+  fi
+
+  echo "[remote-ssh] GitHub Release 直连失败，尝试 Cargo 编译兜底..."
+  if ! command -v cargo >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y cargo rustc >/dev/null 2>&1 || return 1
+    else
+      return 1
+    fi
+  fi
+  cargo install --locked --root "$APP_DIR/bore-cargo" bore-cli >/dev/null 2>&1 || return 1
+  BORE_BIN="$APP_DIR/bore-cargo/bin/bore"
+}
+
+install_bore || {
+  echo "ERROR: Bore 客户端安装失败"
+  echo "备用 Pinggy 脚本:"
+  echo "curl -fsSL https://cdn.jsdelivr.net/gh/witrer/Sesame-AG-TK@main/start_pinggy.sh | bash"
+  exit 2
+}
+
+echo "[4/5] 检查 $BORE_SERVER:7835..."
+if ! python3 - "$BORE_SERVER" 7835 <<'PY' >/dev/null 2>&1
+import socket,sys
 try:
-    s.connect(("127.0.0.1", int(sys.argv[1])))
-except OSError:
-    sys.exit(1)
-finally:
+    s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=8)
     s.close()
+except Exception:
+    sys.exit(1)
 PY
 then
-  echo "ERROR: sshd 未能监听 127.0.0.1:$SSH_PORT"
-  tail -n 50 "$SSHD_LOG" 2>/dev/null || true
-  exit 1
+  echo "ERROR: 当前实例无法连接 $BORE_SERVER:7835"
+  echo "说明这个地区/网络不适合 Bore。备用 Pinggy:"
+  echo "curl -fsSL https://cdn.jsdelivr.net/gh/witrer/Sesame-AG-TK@main/start_pinggy.sh | bash"
+  exit 3
 fi
 
-echo "[remote-ssh] 本机 SSH 握手自检..."
-if ! timeout 8 ssh-keyscan -T 5 -p "$SSH_PORT" 127.0.0.1 >/dev/null 2>>"$SSHD_LOG"; then
-  echo "ERROR: sshd 端口已监听，但 SSH 握手失败"
-  echo "--- sshd log ---"
-  tail -n 80 "$SSHD_LOG" 2>/dev/null || true
-  exit 1
+if [ ! -s "$BORE_PORT_FILE" ]; then
+  python3 - <<'PY' > "$BORE_PORT_FILE"
+import random
+print(random.randint(20000,60000))
+PY
 fi
-echo "[remote-ssh] 本机 SSH 握手正常"
+REMOTE_PORT="$(cat "$BORE_PORT_FILE")"
 
 : > "$TUNNEL_LOG"
 
+# Supervisor: reuse the same requested public port so a short reconnect normally keeps the address stable.
 nohup bash -c '
 while true; do
-  echo "===== NEW TUNNEL $(date -Is) =====" >> "'"$TUNNEL_LOG"'"
-  ssh -T -p 443 \
-    -i "'"$PINGGY_KEY"'" \
-    -o IdentitiesOnly=yes \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -o ServerAliveInterval=30 \
-    -o ServerAliveCountMax=3 \
-    -o ConnectTimeout=15 \
-    -o ExitOnForwardFailure=yes \
-    -R "0:localhost:'"$SSH_PORT"'" \
-    tcp@free.pinggy.io </dev/null >> "'"$TUNNEL_LOG"'" 2>&1 || true
-  echo "===== TUNNEL ENDED $(date -Is), renewing in 5s =====" >> "'"$TUNNEL_LOG"'"
+  echo "===== BORE START $(date -Is) port='"$REMOTE_PORT"' =====" >> "'"$TUNNEL_LOG"'"
+  "'"$BORE_BIN"'" local '"$SSH_PORT"' --to "'"$BORE_SERVER"'" --port '"$REMOTE_PORT"' >> "'"$TUNNEL_LOG"'" 2>&1
+  rc=$?
+  echo "===== BORE END rc=$rc $(date -Is) =====" >> "'"$TUNNEL_LOG"'"
   sleep 5
 done
 ' >/dev/null 2>&1 &
-echo $! > "$TUNNEL_PID"
-
-# Continuously track renewed Pinggy endpoints. Free tunnels expire after ~60 min;
-# the tunnel supervisor reconnects automatically and this watcher updates current.txt.
-nohup bash -c '
-last=""
-while true; do
-  ep="$(grep -Eo "tcp://[^[:space:]]+:[0-9]+" "'"$TUNNEL_LOG"'" 2>/dev/null | tail -n1 | tr -d "\r" || true)"
-  if [ -n "$ep" ] && [ "$ep" != "$last" ]; then
-    hp="${ep#tcp://}"
-    h="${hp%:*}"
-    p="${hp##*:}"
-    {
-      echo "Updated  : $(date -Is)"
-      echo "Endpoint : $ep"
-      echo "Host     : $h"
-      echo "Port     : $p"
-      echo "User     : '"$SSH_USER"'"
-      echo "Password : '"$PASS"'"
-      echo "Connect  : ssh -p $p '"$SSH_USER"'@$h"
-    } > "'"$STATUS_FILE"'"
-    last="$ep"
-  fi
-  sleep 2
-done
-' >/dev/null 2>&1 &
-echo $! > "$WATCHER_PID"
+echo $! > "$SUPERVISOR_PID"
 
 ENDPOINT=""
-for _ in $(seq 1 45); do
-  ENDPOINT="$(grep -Eo 'tcp://[^[:space:]]+:[0-9]+' "$TUNNEL_LOG" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
-  if [ -n "$ENDPOINT" ]; then
+for _ in $(seq 1 30); do
+  if grep -Eq "$BORE_SERVER:[0-9]+" "$TUNNEL_LOG"; then
+    ENDPOINT="$(grep -Eo "$BORE_SERVER:[0-9]+" "$TUNNEL_LOG" | tail -n1)"
+    break
+  fi
+  if grep -qiE "already in use|failed|error" "$TUNNEL_LOG"; then
     break
   fi
   sleep 1
 done
 
-if [ -n "$ENDPOINT" ]; then
-  HOSTPORT="${ENDPOINT#tcp://}"
-  HOST="${HOSTPORT%:*}"
-  PORT="${HOSTPORT##*:}"
+# If requested port was occupied, retry once with a fresh one.
+if [ -z "$ENDPOINT" ]; then
+  kill "$(cat "$SUPERVISOR_PID")" 2>/dev/null || true
+  REMOTE_PORT="$(python3 - <<'PY'
+import random
+print(random.randint(20000,60000))
+PY
+)"
+  echo "$REMOTE_PORT" > "$BORE_PORT_FILE"
+  : > "$TUNNEL_LOG"
+  nohup bash -c '
+while true; do
+  "'"$BORE_BIN"'" local '"$SSH_PORT"' --to "'"$BORE_SERVER"'" --port '"$REMOTE_PORT"' >> "'"$TUNNEL_LOG"'" 2>&1
+  sleep 5
+done
+' >/dev/null 2>&1 &
+  echo $! > "$SUPERVISOR_PID"
+  for _ in $(seq 1 30); do
+    ENDPOINT="$(grep -Eo "$BORE_SERVER:[0-9]+" "$TUNNEL_LOG" 2>/dev/null | tail -n1 || true)"
+    [ -n "$ENDPOINT" ] && break
+    sleep 1
+  done
+fi
 
-  echo "[remote-ssh] 公网端到端 SSH Banner 自检..."
-  PUBLIC_BANNER="$(python3 - "$HOST" "$PORT" <<'PY' 2>/dev/null || true
-import socket, sys
-host, port = sys.argv[1], int(sys.argv[2])
+if [ -z "$ENDPOINT" ]; then
+  echo "ERROR: Bore 未成功建立隧道"
+  tail -n 80 "$TUNNEL_LOG" || true
+  echo
+  echo "备用 Pinggy:"
+  echo "curl -fsSL https://cdn.jsdelivr.net/gh/witrer/Sesame-AG-TK@main/start_pinggy.sh | bash"
+  exit 4
+fi
+
+HOST="${ENDPOINT%:*}"
+PORT="${ENDPOINT##*:}"
+
+echo "[5/5] 公网 SSH Banner 自检..."
+BANNER="$(python3 - "$HOST" "$PORT" <<'PY' 2>/dev/null || true
+import socket,sys
 try:
-    with socket.create_connection((host, port), timeout=8) as s:
-        s.settimeout(8)
-        data = s.recv(256)
-        print(data.decode("ascii", "replace").strip())
+    s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=10)
+    s.settimeout(10)
+    print(s.recv(256).decode("ascii","replace").strip())
+    s.close()
 except Exception:
     pass
 PY
 )"
 
-  if [[ "$PUBLIC_BANNER" != SSH-2.0-* ]]; then
-    echo "ERROR: 公网 TCP 已分配，但没有收到 SSH Banner"
-    echo "Endpoint : $ENDPOINT"
-    echo "Public   : ${PUBLIC_BANNER:-<empty>}"
-    echo "--- Pinggy log ---"
-    tail -n 80 "$TUNNEL_LOG" 2>/dev/null || true
-    echo "--- sshd log ---"
-    tail -n 80 "$SSHD_LOG" 2>/dev/null || true
-    exit 3
-  fi
-
-  echo "[remote-ssh] 公网 SSH Banner 正常: $PUBLIC_BANNER"
-  echo
-  echo "========================================"
-  echo "            REMOTE SSH READY"
-  echo "========================================"
-  echo "WorkDir  : $APP_DIR"
-  echo "User     : $SSH_USER"
-  echo "Password : $PASS"
+if [[ "$BANNER" != SSH-2.0-* ]]; then
+  echo "ERROR: Bore TCP 已建立，但公网 SSH 握手失败"
   echo "Endpoint : $ENDPOINT"
+  echo "Banner   : ${BANNER:-<empty>}"
+  echo "--- Bore log ---"
+  tail -n 80 "$TUNNEL_LOG" || true
+  echo "--- sshd log ---"
+  tail -n 80 "$SSHD_LOG" || true
+  exit 5
+fi
+
+{
+  echo "Mode     : Bore"
+  echo "Updated  : $(date -Is)"
+  echo "WorkDir  : $APP_DIR"
   echo "Host     : $HOST"
   echo "Port     : $PORT"
-  echo "Address  : $HOST:$PORT"
+  echo "User     : $SSH_USER"
+  echo "Password : $PASS"
   echo "Connect  : ssh -p $PORT $SSH_USER@$HOST"
-  echo "Status   : $STATUS_FILE"
-  echo "Renewal  : automatic after free-tunnel expiry"
-  echo "========================================"
-else
-  echo "Tunnel   : FAILED"
-  echo "Log      : $TUNNEL_LOG"
-  echo "========================================"
-  echo
-  echo "--- Pinggy raw output ---"
-  sed -n '1,120p' "$TUNNEL_LOG" 2>/dev/null || true
-  echo "--- sshd log ---"
-  tail -n 80 "$SSHD_LOG" 2>/dev/null || true
-  echo "--- end ---"
-  exit 2
-fi
+} > "$STATUS_FILE"
+
+echo
+echo "========================================"
+echo "            REMOTE SSH READY"
+echo "========================================"
+cat "$STATUS_FILE"
+echo "Banner   : $BANNER"
+echo "========================================"
+echo "Bore 会后台自动重连，并优先继续申请同一个公网端口。"
