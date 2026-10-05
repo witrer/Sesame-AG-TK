@@ -54,6 +54,21 @@ mkdir "$LOCK_DIR"
 echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
+fallback_pinggy() {
+  echo
+  echo "[remote-ssh] Bore 不可用，自动切换 Pinggy..."
+  if [ -s "$SUPERVISOR_PID" ]; then
+    kill "$(cat "$SUPERVISOR_PID" 2>/dev/null || true)" 2>/dev/null || true
+    rm -f "$SUPERVISOR_PID"
+  fi
+  if [ -s "$TUNNEL_PID" ]; then
+    kill "$(cat "$TUNNEL_PID" 2>/dev/null || true)" 2>/dev/null || true
+    rm -f "$TUNNEL_PID"
+  fi
+  rm -rf "$LOCK_DIR"
+  exec bash -c 'curl -fsSL https://cdn.jsdelivr.net/gh/witrer/Sesame-AG-TK@main/start_pinggy.sh | bash'
+}
+
 install_base() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y >/dev/null 2>&1 || true
@@ -177,10 +192,8 @@ install_bore() {
 }
 
 install_bore || {
-  echo "ERROR: Bore 客户端安装失败"
-  echo "备用 Pinggy 脚本:"
-  echo "curl -fsSL https://cdn.jsdelivr.net/gh/witrer/Sesame-AG-TK@main/start_pinggy.sh | bash"
-  exit 2
+  echo "WARN: Bore 客户端安装失败"
+  fallback_pinggy
 }
 
 echo "[4/5] 检查 $BORE_SERVER:7835..."
@@ -193,10 +206,8 @@ except Exception:
     sys.exit(1)
 PY
 then
-  echo "ERROR: 当前实例无法连接 $BORE_SERVER:7835"
-  echo "说明这个地区/网络不适合 Bore。备用 Pinggy:"
-  echo "curl -fsSL https://cdn.jsdelivr.net/gh/witrer/Sesame-AG-TK@main/start_pinggy.sh | bash"
-  exit 3
+  echo "WARN: 当前实例无法连接 $BORE_SERVER:7835，说明当前地区/网络不适合 Bore"
+  fallback_pinggy
 fi
 
 if [ ! -s "$BORE_PORT_FILE" ]; then
@@ -258,12 +269,9 @@ done
 fi
 
 if [ -z "$ENDPOINT" ]; then
-  echo "ERROR: Bore 未成功建立隧道"
+  echo "WARN: Bore 未成功建立隧道"
   tail -n 80 "$TUNNEL_LOG" || true
-  echo
-  echo "备用 Pinggy:"
-  echo "curl -fsSL https://cdn.jsdelivr.net/gh/witrer/Sesame-AG-TK@main/start_pinggy.sh | bash"
-  exit 4
+  fallback_pinggy
 fi
 
 HOST="${ENDPOINT%:*}"
@@ -290,7 +298,7 @@ if [[ "$BANNER" != SSH-2.0-* ]]; then
   tail -n 80 "$TUNNEL_LOG" || true
   echo "--- sshd log ---"
   tail -n 80 "$SSHD_LOG" || true
-  exit 5
+  fallback_pinggy
 fi
 
 {
