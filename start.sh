@@ -4,6 +4,26 @@ set -Eeuo pipefail
 SSH_PORT="${SSH_PORT:-22222}"
 SSH_USER="${SSH_USER:-remoteai}"
 
+port_in_use() {
+  ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${1}$"
+}
+
+pick_ssh_port() {
+  local p
+  if ! port_in_use "$SSH_PORT"; then
+    printf '%s' "$SSH_PORT"
+    return
+  fi
+  for p in $(seq 22223 22350); do
+    if ! port_in_use "$p"; then
+      printf '%s' "$p"
+      return
+    fi
+  done
+  echo "ERROR: 22222-22350 没有可用端口" >&2
+  return 1
+}
+
 pick_app_dir() {
   local c
   if [ -n "${REMOTE_SSH_DIR:-}" ]; then
@@ -27,7 +47,7 @@ APP_DIR="$(pick_app_dir)" || {
   exit 1
 }
 
-SSH_PORT="${SSH_PORT:-22222}"
+SSH_PORT="$(pick_ssh_port)" || exit 1
 SSH_USER="${SSH_USER:-remoteai}"
 PASS_FILE="${APP_DIR}/password"
 SSHD_CONFIG="${APP_DIR}/sshd_config"
@@ -40,6 +60,7 @@ PINGGY_KEY="${APP_DIR}/pinggy_ed25519"
 mkdir -p "$APP_DIR"
 chmod 700 "$APP_DIR"
 echo "[remote-ssh] 工作目录: $APP_DIR"
+echo "[remote-ssh] SSH端口: $SSH_PORT"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERROR: 请用 root 运行：sudo bash"
