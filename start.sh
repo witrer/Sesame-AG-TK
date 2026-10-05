@@ -113,6 +113,7 @@ if [ ! -s "$PASS_FILE" ]; then
 fi
 PASS="$(cat "$PASS_FILE")"
 echo "$SSH_USER:$PASS" | chpasswd
+usermod -U root >/dev/null 2>&1 || true
 
 mkdir -p "$APP_DIR/keys" /run/sshd
 [ -f "$APP_DIR/keys/ssh_host_ed25519_key" ] || ssh-keygen -q -t ed25519 -N "" -f "$APP_DIR/keys/ssh_host_ed25519_key"
