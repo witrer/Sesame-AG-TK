@@ -168,10 +168,10 @@ done
 ' >/dev/null 2>&1 &
 echo $! > "$TUNNEL_PID"
 
-HOSTPORT=""
+ENDPOINT=""
 for _ in $(seq 1 45); do
-  HOSTPORT="$(grep -Eo '([A-Za-z0-9._-]+\.pinggy\.(link|io)):[0-9]+' "$TUNNEL_LOG" 2>/dev/null | tail -n1 || true)"
-  if [ -n "$HOSTPORT" ]; then
+  ENDPOINT="$(grep -Eo 'tcp://[^[:space:]]+:[0-9]+' "$TUNNEL_LOG" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+  if [ -n "$ENDPOINT" ]; then
     break
   fi
   sleep 1
@@ -185,9 +185,11 @@ echo "WorkDir  : $APP_DIR"
 echo "User     : $SSH_USER"
 echo "Password : $PASS"
 
-if [ -n "$HOSTPORT" ]; then
+if [ -n "$ENDPOINT" ]; then
+  HOSTPORT="${ENDPOINT#tcp://}"
   HOST="${HOSTPORT%:*}"
   PORT="${HOSTPORT##*:}"
+  echo "Endpoint : $ENDPOINT"
   echo "Host     : $HOST"
   echo "Port     : $PORT"
   echo "Address  : $HOST:$PORT"
@@ -198,6 +200,8 @@ else
   echo "Log      : $TUNNEL_LOG"
   echo "========================================"
   echo
-  tail -n 30 "$TUNNEL_LOG" 2>/dev/null || true
+  echo "--- Pinggy raw output ---"
+  sed -n '1,120p' "$TUNNEL_LOG" 2>/dev/null || true
+  echo "--- end ---"
   exit 2
 fi
