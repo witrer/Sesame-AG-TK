@@ -140,7 +140,9 @@ PermitEmptyPasswords no
 PermitRootLogin no
 PubkeyAuthentication yes
 ChallengeResponseAuthentication no
-UsePAM no
+UsePAM yes
+PrintMotd no
+PrintLastLog no
 X11Forwarding no
 AllowTcpForwarding yes
 GatewayPorts no
@@ -171,6 +173,15 @@ then
   tail -n 50 "$SSHD_LOG" 2>/dev/null || true
   exit 1
 fi
+
+echo "[remote-ssh] 本机 SSH 握手自检..."
+if ! timeout 8 ssh-keyscan -T 5 -p "$SSH_PORT" 127.0.0.1 >/dev/null 2>>"$SSHD_LOG"; then
+  echo "ERROR: sshd 端口已监听，但 SSH 握手失败"
+  echo "--- sshd log ---"
+  tail -n 80 "$SSHD_LOG" 2>/dev/null || true
+  exit 1
+fi
+echo "[remote-ssh] 本机 SSH 握手正常"
 
 if [ -s "$TUNNEL_PID" ] && kill -0 "$(cat "$TUNNEL_PID")" 2>/dev/null; then
   kill "$(cat "$TUNNEL_PID")" 2>/dev/null || true
@@ -222,6 +233,8 @@ else
   echo
   echo "--- Pinggy raw output ---"
   sed -n '1,120p' "$TUNNEL_LOG" 2>/dev/null || true
+  echo "--- sshd log ---"
+  tail -n 80 "$SSHD_LOG" 2>/dev/null || true
   echo "--- end ---"
   exit 2
 fi
